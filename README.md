@@ -5,6 +5,11 @@ MASLD Phenotyping Using Unsupervised Machine Learning
 **Metabolic dysfunction-associated steatotic liver disease (MASLD)**, previously known as **non-alcoholic fatty liver disease (NAFLD)**, is a form of steatotic liver disease characterized by excess fat accumulation in the liver in the presence of cardiometabolic risk factors such as obesity, dysglycemia, hypertension, and dyslipidemia.
 
 Because these metabolic abnormalities can occur in different combinations and severities, MASLD is a **heterogeneous condition**. This project uses **unsupervised machine learning** to determine whether individuals in a MASLD cohort can be grouped into distinct phenotypic patterns based on their clinical and metabolic characteristics.
+ ## MASLD Disease Spectrum
+
+<img src="https://media.springernature.com/full/springer-static/image/art%3A10.1038%2Fs41423-025-01307-5/MediaObjects/41423_2025_1307_Fig1_HTML.png" alt="MASLD disease spectrum" width="650"/>
+
+*Figure adapted from He et al., 2025, Cellular & Molecular Immunology, licensed under CC BY 4.0. The figure illustrates the progression of MASLD from steatosis through hepatitis, cirrhosis and liver cancer, and highlights metabolic and genetic factors involved in disease progression.*
 
 ## What Was Analyzed?
 
