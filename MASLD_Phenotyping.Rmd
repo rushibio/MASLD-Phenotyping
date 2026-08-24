@@ -1,0 +1,413 @@
+
+
+---
+Title: "MASLD Phenotyping Using Unsupervised Machine Learning"
+---
+
+```{r setup}
+library(dplyr)
+library(cluster)
+library(ggplot2)
+library(reshape2)
+library(NbClust)
+library(e1071)
+library(fmsb)
+library(mclust)
+library(MASS)
+library(gridExtra)
+library(grid)
+
+while (!is.null(dev.list())) dev.off()
+
+# ---- EDIT THIS ONE LINE ONLY — path to your prepared cohort CSV ----
+INPUT_FILE <- "D:/MASLD/cohort_data.csv"
+K_RANGE <- 3:10
+GAP_B <- 5
+NBOOT <- 10
+```
+
+## Section 1: Load, Filter, Prepare Clustering Data
+
+```{r load-filter}
+if (!file.exists(INPUT_FILE)) stop("File not found: ", INPUT_FILE)
+
+masld_cohort <- read.csv(INPUT_FILE, stringsAsFactors = FALSE, check.names = FALSE)
+cat("Rows:", nrow(masld_cohort), "| Columns:", ncol(masld_cohort), "\n")
+
+masld_clean <- masld_cohort %>%
+  filter(is.na(Urine_Pregnancy) | Urine_Pregnancy != 1) %>%
+  filter(is.na(HepB_Core_Ab) | HepB_Core_Ab != 1) %>%
+  filter(is.na(HepC_Ab) | !(HepC_Ab %in% c(1, 4))) %>%
+  filter(
+    is.na(Alcohol_Days) | is.na(Gender) |
+      (!(Alcohol_Days %in% c(777, 999)) &
+         !((Gender == 1 & Alcohol_Days >= 2) |
+             (Gender == 2 & Alcohol_Days >= 1)))
+  ) %>%
+  filter(is.na(Elastography_Status) | !(Elastography_Status %in% c(2, 3, 4))) %>%
+  filter(CAP_Median >= 288)
+
+crit1 <- masld_clean$BMI >= 25
+crit2 <- masld_clean$Fasting_Glucose >= 100 | masld_clean$HbA1c >= 5.7 | masld_clean$Diabetes == 1
+crit3 <- masld_clean$SBP_AVG >= 130
+crit4 <- masld_clean$Triglycerides >= 150
+crit5 <- (masld_clean$Gender == 1 & masld_clean$HDL <= 40) | (masld_clean$Gender == 2 & masld_clean$HDL <= 50)
+has_cmrf <- rowSums(cbind(crit1, crit2, crit3, crit4, crit5), na.rm = TRUE) >= 1
+
+masld_clean <- masld_clean %>% filter((Age >= 18 | is.na(Age)) & has_cmrf)
+cat("Filtered cohort rows:", nrow(masld_clean), "\n")
+
+clustering_vars <- c("Age", "BMI", "HbA1c", "ALT", "LDL", "Triglycerides",
+                     "Waist", "SBP_AVG", "Fasting_Glucose")
+fasting_vars <- c("LDL", "Triglycerides", "Fasting_Glucose")
+impute_vars <- setdiff(clustering_vars, fasting_vars)
+
+df <- masld_clean[complete.cases(masld_clean[, fasting_vars]), c("SEQN", clustering_vars)]
+for (v in impute_vars) df[[v]][is.na(df[[v]])] <- median(df[[v]], na.rm = TRUE)
+cat("Rows after listwise deletion + imputation:", nrow(df), "\n")
+
+temp_scaled <- scale(df[, clustering_vars])
+outlier_rows <- apply(temp_scaled, 1, function(r) any(abs(r) >= 5))
+df_raw_before <- df
+df <- df[!outlier_rows, ]
+cat("Outliers removed:", sum(outlier_rows), "| Final N:", nrow(df), "\n")
+
+scaled <- scale(df[, clustering_vars])
+rownames(scaled) <- df$SEQN
+dmat <- dist(scaled, method = "euclidean")
+```
+
+## Section 2: Before / After Normalization
+
+```{r normalization-plots}
+before_long <- melt(df_raw_before[, clustering_vars], variable.name = "Variable", value.name = "Value")
+ggplot(before_long, aes(Variable, Value)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Before Normalization (raw units, incl. outliers)", x = "", y = "Value") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+after_long <- melt(as.data.frame(scaled), variable.name = "Variable", value.name = "Value")
+ggplot(after_long, aes(Variable, Value)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(title = "After Normalization (z-scores, outliers removed)", x = "", y = "Standardized value") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r gap-helper}
+get_gap_best_k <- function(gap_obj) {
+  tab <- as.data.frame(gap_obj$Tab)
+  list(max_gap_k = which.max(tab$gap),
+       best_k_1se = maxSE(tab$gap, tab$SE.sim, method = "firstSEmax"))
+}
+```
+
+## Section 3: PAM — Euclidean
+
+```{r pam-euclidean}
+pam_euc_sil <- c(); pam_euc_models <- list()
+for (k in K_RANGE) {
+  set.seed(24)
+  m <- pam(scaled, k = k, metric = "euclidean", nstart = NBOOT)
+  pam_euc_models[[as.character(k)]] <- m
+  pam_euc_sil[as.character(k)] <- mean(silhouette(m)[, 3])
+}
+pam_euc_table <- data.frame(k = K_RANGE, avg_silhouette = round(pam_euc_sil, 4))
+print(pam_euc_table, row.names = FALSE)
+pam_euc_best_k <- pam_euc_table$k[which.max(pam_euc_table$avg_silhouette)]
+pam_euc_best <- pam_euc_models[[as.character(pam_euc_best_k)]]
+cat("Best k (PAM Euclidean):", pam_euc_best_k, "\n")
+
+set.seed(24)
+gap_pam_euc <- clusGap(scaled, FUNcluster = function(x, k) {
+  set.seed(24); list(cluster = pam(x, k, metric = "euclidean", nstart = NBOOT)$clustering)
+}, K.max = max(K_RANGE), B = GAP_B)
+gap_pam_euc_res <- get_gap_best_k(gap_pam_euc)
+cat("Gap — max-gap k:", gap_pam_euc_res$max_gap_k, "| 1-SE k:", gap_pam_euc_res$best_k_1se, "\n")
+```
+
+## Section 4: PAM — Manhattan (main method)
+
+```{r pam-manhattan}
+pam_man_sil <- c(); pam_man_models <- list()
+for (k in K_RANGE) {
+  set.seed(24)
+  m <- pam(scaled, k = k, metric = "manhattan", nstart = NBOOT)
+  pam_man_models[[as.character(k)]] <- m
+  pam_man_sil[as.character(k)] <- mean(silhouette(m)[, 3])
+}
+pam_man_table <- data.frame(k = K_RANGE, avg_silhouette = round(pam_man_sil, 4))
+print(pam_man_table, row.names = FALSE)
+pam_man_best_k <- pam_man_table$k[which.max(pam_man_table$avg_silhouette)]
+pam_man_best <- pam_man_models[[as.character(pam_man_best_k)]]
+cat("Best k (PAM Manhattan):", pam_man_best_k, "\n")
+
+set.seed(24)
+gap_pam_man <- clusGap(scaled, FUNcluster = function(x, k) {
+  set.seed(24); list(cluster = pam(x, k, metric = "manhattan", nstart = NBOOT)$clustering)
+}, K.max = max(K_RANGE), B = GAP_B)
+gap_pam_man_res <- get_gap_best_k(gap_pam_man)
+cat("Gap — max-gap k:", gap_pam_man_res$max_gap_k, "| 1-SE k:", gap_pam_man_res$best_k_1se, "\n")
+
+plot(silhouette(pam_man_best), main = paste("PAM Manhattan Silhouette (k =", pam_man_best_k, ")"),
+     col = 1:pam_man_best_k, border = NA)
+```
+
+## Section 5: K-means
+
+```{r kmeans}
+km_sil <- c(); km_models <- list()
+for (k in K_RANGE) {
+  set.seed(24)
+  m <- kmeans(scaled, centers = k, nstart = NBOOT, iter.max = 1000)
+  km_models[[as.character(k)]] <- m
+  km_sil[as.character(k)] <- mean(silhouette(m$cluster, dmat)[, 3])
+}
+km_table <- data.frame(k = K_RANGE, avg_silhouette = round(km_sil, 4))
+print(km_table, row.names = FALSE)
+km_best_k <- km_table$k[which.max(km_table$avg_silhouette)]
+km_best <- km_models[[as.character(km_best_k)]]
+cat("Best k (K-means):", km_best_k, "\n")
+
+set.seed(24)
+gap_km <- clusGap(scaled, FUNcluster = function(x, k) {
+  set.seed(24); list(cluster = kmeans(x, centers = k, nstart = NBOOT, iter.max = 1000)$cluster)
+}, K.max = max(K_RANGE), B = GAP_B)
+gap_km_res <- get_gap_best_k(gap_km)
+cat("Gap — max-gap k:", gap_km_res$max_gap_k, "| 1-SE k:", gap_km_res$best_k_1se, "\n")
+```
+
+## Section 6: NbClust
+
+```{r nbclust}
+set.seed(24)
+nb <- NbClust(data = scaled, distance = "euclidean",
+              min.nc = min(K_RANGE), max.nc = max(K_RANGE), method = "kmeans", index = "all")
+nb_best_k <- as.numeric(names(which.max(table(nb$Best.nc[1, ]))))
+cat("NbClust majority-vote best k:", nb_best_k, "\n")
+
+nb_votes <- as.data.frame(table(k = nb$Best.nc[1, ]))
+ggplot(nb_votes, aes(k, Freq)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "NbClust — Indices Voting for Each k", x = "k", y = "Number of indices") +
+  theme_minimal()
+```
+
+## Section 7: Fuzzy C-Means
+
+```{r fuzzy-cmeans}
+fcm_sil <- c(); fcm_models <- list()
+for (k in K_RANGE) {
+  set.seed(24 + k)
+  fm <- cmeans(scaled, centers = k, iter.max = 1000, m = 2, method = "cmeans")
+  fcm_models[[as.character(k)]] <- fm
+  fcm_sil[as.character(k)] <- mean(silhouette(fm$cluster, dmat)[, 3])
+}
+fcm_table <- data.frame(k = K_RANGE, avg_silhouette = round(fcm_sil, 4))
+print(fcm_table, row.names = FALSE)
+fcm_best_k <- fcm_table$k[which.max(fcm_table$avg_silhouette)]
+fcm_best <- fcm_models[[as.character(fcm_best_k)]]
+cat("Best k (Fuzzy C-Means):", fcm_best_k, "\n")
+
+set.seed(24)
+gap_fcm <- clusGap(scaled, FUNcluster = function(x, k) {
+  list(cluster = cmeans(x, centers = k, iter.max = 1000, m = 2, method = "cmeans")$cluster)
+}, K.max = max(K_RANGE), B = GAP_B)
+gap_fcm_res <- get_gap_best_k(gap_fcm)
+cat("Gap — max-gap k:", gap_fcm_res$max_gap_k, "| 1-SE k:", gap_fcm_res$best_k_1se, "\n")
+```
+
+## Section 8: Main Plots — PAM Manhattan
+
+```{r main-plots}
+cluster_vec_man <- factor(pam_man_best$clustering)
+
+# PCA
+pca <- prcomp(scaled)
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], Cluster = cluster_vec_man)
+cluster_colors <- rainbow(nlevels(cluster_vec_man)); names(cluster_colors) <- levels(cluster_vec_man)
+
+ggplot(pca_df, aes(PC1, PC2, color = Cluster, fill = Cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  stat_ellipse(geom = "polygon", alpha = 0.15, level = 0.95) +
+  scale_color_manual(values = cluster_colors) + scale_fill_manual(values = cluster_colors) +
+  labs(title = paste("PCA Cluster Plot - PAM Manhattan (k =", pam_man_best_k, ")")) +
+  theme_minimal() + theme(legend.position = "right")
+
+# Radar chart
+z_profile <- aggregate(as.data.frame(scaled), by = list(Cluster = cluster_vec_man), FUN = mean)
+radar_data <- z_profile[, clustering_vars]
+rownames(radar_data) <- paste0("Cluster_", z_profile$Cluster)
+radar_plot_df <- rbind(rep(3, ncol(radar_data)), rep(-3, ncol(radar_data)), radar_data)
+radar_colors <- rainbow(nrow(radar_data))
+
+old_par <- par(no.readonly = TRUE)
+layout(matrix(c(1,2), nrow = 1), widths = c(3,1))
+par(mar = c(2,2,4,1))
+radarchart(radar_plot_df, axistype = 1, pcol = radar_colors, plwd = 2, plty = 1,
+           cglcol = "grey", cglty = 1, axislabcol = "grey30", cglwd = 0.8, vlcex = 0.75,
+           title = "Radar Chart (Z-score) - PAM Manhattan")
+par(mar = c(2,0,4,0)); plot.new()
+legend("center", legend = rownames(radar_data), col = radar_colors, lty = 1, lwd = 2, bty = "n", cex = 0.85)
+par(old_par); layout(1)
+
+# Parallel coordinates
+plot_colors_man <- rainbow(nlevels(cluster_vec_man))[as.integer(cluster_vec_man)]
+old_par <- par(no.readonly = TRUE)
+layout(matrix(c(1,2), nrow = 1), widths = c(4,1))
+par(mar = c(7,4,4,1), las = 2)
+MASS::parcoord(df[, clustering_vars], col = plot_colors_man, var.label = TRUE)
+title(main = "Parallel Coordinate Plot - PAM Manhattan", line = 2)
+par(mar = c(7,0,4,0), las = 1); plot.new()
+legend("center", legend = levels(cluster_vec_man), col = rainbow(nlevels(cluster_vec_man)),
+       lty = 1, lwd = 2, cex = 0.85, bty = "n")
+par(old_par); layout(1)
+
+# Cluster profile boxplots
+raw_with_cluster <- as.data.frame(df[, clustering_vars]); raw_with_cluster$Cluster <- cluster_vec_man
+raw_long <- melt(raw_with_cluster, id.vars = "Cluster", measure.vars = clustering_vars,
+                 variable.name = "Variable", value.name = "Value")
+ggplot(raw_long, aes(Cluster, Value, fill = Cluster)) +
+  geom_boxplot(outlier.size = 0.6, alpha = 0.8) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Cluster Profile Boxplots (raw units) - PAM Manhattan") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+## Section 8b: Population Group Distribution (Bar + Pie by Cluster)
+
+```{r group-distribution}
+group_labels <- c("1" = "Group A", "2" = "Group B", "3" = "Group C", "4" = "Group D", "5" = "Group E")
+group_lookup <- data.frame(SEQN = df$SEQN, Cluster = pam_man_best$clustering)
+group_merged <- merge(masld_clean[, c("SEQN", "Race")], group_lookup, by = "SEQN", all.y = TRUE)
+group_merged$Group_Full <- group_labels[as.character(group_merged$Race)]
+
+group_dist <- as.data.frame(table(Group = factor(group_merged$Group_Full, levels = group_labels),
+                                  Cluster = factor(group_merged$Cluster)))
+
+# Bar chart
+ggplot(group_dist, aes(Cluster, Freq, fill = Group)) +
+  geom_col(position = "dodge") + scale_fill_brewer(palette = "Set2") +
+  labs(title = "Population Group Distribution by Cluster", x = "Cluster", y = "Count", fill = "Group") +
+  theme_minimal() + theme(legend.position = "right")
+
+# Pie chart per cluster, faceted
+group_dist_pct <- group_dist %>%
+  group_by(Cluster) %>%
+  mutate(Pct = round(100 * Freq / sum(Freq), 1)) %>%
+  ungroup()
+
+ggplot(group_dist_pct, aes(x = "", y = Freq, fill = Group)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  facet_wrap(~ Cluster, labeller = label_both) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Population Group Composition by Cluster (%)") +
+  theme_void() +
+  theme(legend.position = "right",
+        strip.text = element_text(face = "bold", size = 11)) +
+  geom_text(aes(label = ifelse(Pct >= 5, paste0(Pct, "%"), "")),
+            position = position_stack(vjust = 0.5), size = 3)
+
+cat("\nGroup distribution by cluster (raw counts):\n")
+print(table(group_merged$Group_Full, group_merged$Cluster, useNA = "ifany"))
+```
+
+## Section 9: Cross-Method Agreement + Stability (1000x 80% Subsample ARI)
+
+```{r stability}
+ari <- function(a, b) round(adjustedRandIndex(a, b), 4)
+
+cat("\n--- Cross-method agreement (single run) ---\n")
+cat("PAM Manhattan vs PAM Euclidean:", ari(pam_man_best$clustering, pam_euc_best$clustering), "\n")
+cat("PAM Manhattan vs K-means:      ", ari(pam_man_best$clustering, km_best$cluster), "\n")
+cat("PAM Manhattan vs Fuzzy C-Means:", ari(pam_man_best$clustering, fcm_best$cluster), "\n")
+
+set.seed(24)
+n_total <- nrow(scaled)
+subsample_size <- floor(0.8 * n_total)
+n_iter <- 1000
+stability_ari <- numeric(n_iter)
+reference_clusters <- pam_man_best$clustering
+names(reference_clusters) <- rownames(scaled)
+
+for (i in 1:n_iter) {
+  idx <- sample(1:n_total, subsample_size, replace = FALSE)
+  sub_data <- scaled[idx, ]
+  sub_model <- tryCatch(pam(sub_data, k = pam_man_best_k, metric = "manhattan", nstart = 5),
+                        error = function(e) NULL)
+  stability_ari[i] <- if (!is.null(sub_model)) {
+    ari(reference_clusters[rownames(sub_data)], sub_model$clustering)
+  } else NA
+}
+
+cat("\n=== STABILITY (1000x 80% subsample, PAM Manhattan k =", pam_man_best_k, ") ===\n")
+cat("Mean ARI:", round(mean(stability_ari, na.rm = TRUE), 4),
+    "| Median:", round(median(stability_ari, na.rm = TRUE), 4),
+    "| SD:", round(sd(stability_ari, na.rm = TRUE), 4), "\n")
+
+ggplot(data.frame(ARI = stability_ari), aes(x = ARI)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = mean(stability_ari, na.rm = TRUE), color = "red", linetype = "dashed") +
+  labs(title = paste("Cluster Stability — 1000x 80% Subsample ARI (k =", pam_man_best_k, ")"),
+       x = "ARI vs full-sample clustering", y = "Count") +
+  theme_minimal()
+```
+
+## Section 10: Cluster Characterization (auto-derived from results)
+
+```{r characterize-clusters}
+# For each cluster, list which clustering variables are most elevated (>+0.3 SD)
+# and most reduced (<-0.3 SD) relative to the overall sample mean — this turns
+# the z-score profile into a plain-language summary automatically, rather than
+# requiring a manual read of the radar chart each time.
+
+z_profile_named <- z_profile
+rownames(z_profile_named) <- paste("Cluster", z_profile_named$Cluster)
+
+cluster_summary_table <- df
+cluster_summary_table$Cluster <- cluster_vec_man
+
+descriptive_table <- cluster_summary_table %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(clustering_vars),
+                   list(median = ~median(.x, na.rm = TRUE),
+                        IQR = ~IQR(.x, na.rm = TRUE)))) %>%
+  as.data.frame()
+
+cat("=== DESCRIPTIVE SUMMARY (median [IQR]) BY CLUSTER ===\n")
+print(descriptive_table, row.names = FALSE)
+
+cat("\n=== AUTO-GENERATED CLUSTER PROFILE SUMMARY ===\n")
+for (i in seq_len(nrow(z_profile))) {
+  cl <- z_profile$Cluster[i]
+  vals <- unlist(z_profile[i, clustering_vars])
+  elevated <- names(sort(vals[vals > 0.3], decreasing = TRUE))
+  reduced  <- names(sort(vals[vals < -0.3]))
+  n_members <- sum(cluster_vec_man == cl)
+
+  cat("\n--- Cluster", cl, "(n =", n_members, ") ---\n")
+  if (length(elevated) > 0) {
+    cat("  Elevated (>+0.3 SD):", paste(elevated, collapse = ", "), "\n")
+  } else {
+    cat("  Elevated (>+0.3 SD): none\n")
+  }
+  if (length(reduced) > 0) {
+    cat("  Reduced  (<-0.3 SD):", paste(reduced, collapse = ", "), "\n")
+  } else {
+    cat("  Reduced  (<-0.3 SD): none\n")
+  }
+}
+```
+
+## Final Summary
+
+```{r final-summary}
+cat("\n========================================\nSUMMARY\n========================================\n")
+cat("PAM Manhattan (MAIN) — best k:", pam_man_best_k, "| silhouette:", round(max(pam_man_sil), 4),
+    "| Gap 1-SE k:", gap_pam_man_res$best_k_1se, "\n")
+cat("PAM Euclidean         — best k:", pam_euc_best_k, "| Gap 1-SE k:", gap_pam_euc_res$best_k_1se, "\n")
+cat("K-means               — best k:", km_best_k, "| Gap 1-SE k:", gap_km_res$best_k_1se, "\n")
+cat("NbClust majority vote — best k:", nb_best_k, "\n")
+cat("Fuzzy C-Means         — best k:", fcm_best_k, "| Gap 1-SE k:", gap_fcm_res$best_k_1se, "\n")
+cat("Stability (1000x 80% ARI, mean):", round(mean(stability_ari, na.rm = TRUE), 4), "\n")
+```
